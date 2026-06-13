@@ -67,19 +67,35 @@ def generate_tts(
     model = _load_model()
     min_reference_ms = int(os.getenv("VOXCPM_MIN_REFERENCE_MS", "1200"))
     fallback = _fallback_reference(vocals_dir, min_reference_ms)
+    cfg_value = float(os.getenv("VOXCPM_CFG_VALUE", "2.0"))
+    inference_timesteps = int(os.getenv("VOXCPM_INFERENCE_TIMESTEPS", "10"))
+
+    fallback_cache = None
 
     for index, item in enumerate(items, start=1):
         output_file = output_dir / f"{index:04d}.wav"
         if not output_file.exists():
             reference = vocals_dir / f"{index:04d}.wav"
             if not reference.exists() or len(AudioSegment.from_file(reference)) < min_reference_ms:
-                reference = fallback
-            wav = model.generate(
-                text=item.get("dst") or item.get("zh", ""),
-                reference_wav_path=str(reference),
-                cfg_value=float(os.getenv("VOXCPM_CFG_VALUE", "2.0")),
-                inference_timesteps=int(os.getenv("VOXCPM_INFERENCE_TIMESTEPS", "10")),
-            )
+                if fallback_cache is None:
+                    fallback_cache = model.tts_model.build_prompt_cache(
+                        reference_wav_path=str(fallback)
+                    )
+                result = model.tts_model.generate_with_prompt_cache(
+                    target_text=item.get("dst") or item.get("zh", ""),
+                    prompt_cache=fallback_cache,
+                    cfg_value=cfg_value,
+                    inference_timesteps=inference_timesteps,
+                )
+                wav_tensor, _, _ = result
+                wav = wav_tensor.squeeze(0).cpu().numpy()
+            else:
+                wav = model.generate(
+                    text=item.get("dst") or item.get("zh", ""),
+                    reference_wav_path=str(reference),
+                    cfg_value=cfg_value,
+                    inference_timesteps=inference_timesteps,
+                )
             sf.write(output_file, wav, model.tts_model.sample_rate)
         if progress_callback:
             progress = round(index / total * 100)
