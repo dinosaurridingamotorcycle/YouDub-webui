@@ -186,3 +186,55 @@ def test_stage_progress_is_throttled(monkeypatch, tmp_path):
     stage = {entry["name"]: entry for entry in database.get_task(task_id)["stages"]}["tts"]
     assert stage["progress"] == 30
     assert stage["last_message"] == "Prepared 3/10 TTS clips"
+
+
+def test_pipeline_manual_pauses_after_each_stage(monkeypatch, tmp_path):
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=manualstepx",
+        task_id="manualstepx",
+        execution_mode="manual",
+    )
+
+    def download(self, task):
+        session = tmp_path / "session"
+        media = session / "media"
+        media.mkdir(parents=True)
+        video = media / "video_source.mp4"
+        video.write_bytes(b"video")
+        self.artifacts.session = session
+        self.artifacts.video_file = video
+        database.update_task(self.task_id, session_path=str(session), title="manual")
+
+    monkeypatch.setattr(PipelineRunner, "_download", download)
+
+    def fail_later(name):
+        def handler(self, task):
+            raise AssertionError(f"unexpected stage {name}")
+
+        return handler
+
+    for name in ("_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_merge_video"):
+        monkeypatch.setattr(PipelineRunner, name, fail_later(name))
+
+    PipelineRunner(task_id).run()
+    task = database.get_task(task_id)
+    assert task["status"] == "paused"
+    assert task["stages"][0]["status"] == "succeeded"
+    assert task["stages"][1]["status"] == "pending"
+
+    def separate(self, task):
+        vocals = self.artifacts.session / "media" / "audio_vocals.wav"
+        bgm = self.artifacts.session / "media" / "audio_bgm.wav"
+        vocals.write_bytes(b"v")
+        bgm.write_bytes(b"b")
+        self.artifacts.vocals_file = vocals
+        self.artifacts.bgm_file = bgm
+
+    monkeypatch.setattr(PipelineRunner, "_separate", separate)
+    database.queue_task_for_continue(task_id)
+    PipelineRunner(task_id).run()
+    task = database.get_task(task_id)
+    assert task["status"] == "paused"
+    assert task["stages"][1]["status"] == "succeeded"
+    assert task["stages"][2]["status"] == "pending"

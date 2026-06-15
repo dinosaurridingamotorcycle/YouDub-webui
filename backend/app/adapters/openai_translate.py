@@ -227,6 +227,24 @@ def _full_text(data: dict[str, Any], texts: list[str]) -> str:
     return " ".join(texts)
 
 
+def preprocess_artifact_path(session: Path) -> Path:
+    return session / "metadata" / "translation_preprocess.json"
+
+
+def write_preprocess_artifact(session: Path, pre: PreprocessResponse) -> Path:
+    path = preprocess_artifact_path(session)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(pre.model_dump(), ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def load_preprocess_artifact(session: Path) -> PreprocessResponse | None:
+    path = preprocess_artifact_path(session)
+    if not path.exists():
+        return None
+    return PreprocessResponse.model_validate(json.loads(path.read_text(encoding="utf-8")))
+
+
 def _concurrency_from(settings: dict[str, str]) -> int:
     raw = str(settings.get("translate_concurrency") or "").strip()
     if not raw or not all("0" <= char <= "9" for char in raw):
@@ -254,7 +272,13 @@ def translate_asr(
     meta = _read_meta(session)
 
     api = {key: settings[key] for key in API_SETTING_KEYS if key in settings}
-    pre = preprocess(full_text, meta, source, **api)
+    pre = load_preprocess_artifact(session)
+    if pre is None:
+        pre = preprocess(full_text, meta, source, **api)
+        write_preprocess_artifact(session, pre)
+        log.info("Wrote translation preprocess artifact to %s", preprocess_artifact_path(session))
+    else:
+        log.info("Reusing translation preprocess artifact from %s", preprocess_artifact_path(session))
     dst_list = translate_batch(
         texts, source, meta, pre, **api, concurrency=_concurrency_from(settings)
     )

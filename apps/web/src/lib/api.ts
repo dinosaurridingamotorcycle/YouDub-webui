@@ -9,7 +9,8 @@ function configuredApiBase(): string {
 export const API_BASE = configuredApiBase()
 
 export type StageStatus = "pending" | "running" | "succeeded" | "failed"
-export type TaskStatus = "queued" | "running" | "succeeded" | "failed"
+export type TaskStatus = "queued" | "running" | "paused" | "succeeded" | "failed"
+export type ExecutionMode = "auto" | "manual"
 
 export type TaskStage = {
   task_id: string
@@ -35,6 +36,7 @@ export type Task = {
   created_at: string
   started_at: string | null
   completed_at: string | null
+  execution_mode: ExecutionMode
   stages: TaskStage[]
 }
 
@@ -93,6 +95,7 @@ export type TaskSummary = {
   created_at: string
   started_at: string | null
   completed_at: string | null
+  execution_mode?: ExecutionMode
 }
 
 export function getCurrentTask() {
@@ -127,17 +130,30 @@ export function resumeTask(taskId: string) {
   return request<Task>(`/api/tasks/${taskId}/resume`, { method: "POST" })
 }
 
-export function createTask(url: string) {
+export function continueTask(taskId: string) {
+  return request<Task>(`/api/tasks/${taskId}/continue`, { method: "POST" })
+}
+
+export function redoStage(taskId: string, stageName: string) {
+  return request<Task>(`/api/tasks/${taskId}/stages/${stageName}/redo`, { method: "POST" })
+}
+
+export function createTask(url: string, executionMode: ExecutionMode = "auto") {
   return request<Task>("/api/tasks", {
     method: "POST",
-    body: JSON.stringify({ url }),
+    body: JSON.stringify({ url, execution_mode: executionMode }),
   })
 }
 
-export async function uploadLocalTask(file: File, direction: LocalDirection) {
+export async function uploadLocalTask(
+  file: File,
+  direction: LocalDirection,
+  executionMode: ExecutionMode = "auto",
+) {
   const form = new FormData()
   form.append("direction", direction)
   form.append("file", file)
+  form.append("execution_mode", executionMode)
 
   const response = await fetch(`${API_BASE}/api/tasks/upload`, {
     method: "POST",

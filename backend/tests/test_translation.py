@@ -8,6 +8,7 @@ from backend.app.adapters import openai_translate
 from backend.app.adapters.openai_translate import (
     HotwordItem,
     PreprocessResponse,
+    CorrectionItem,
 )
 from backend.app.sources import detect_source
 
@@ -49,6 +50,56 @@ def _stub_translate_batch(monkeypatch, transform):
 
     monkeypatch.setattr(openai_translate, "translate_batch", fake)
     return seen
+
+
+def test_translate_asr_writes_preprocess_artifact(tmp_path, monkeypatch):
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    asr_file = metadata / "asr_fixed.json"
+    _write_asr(asr_file, 1)
+
+    pre = PreprocessResponse(
+        summary="Video recap",
+        hotwords=[HotwordItem(src="Fable 5", dst="Fable 5")],
+        corrections=[CorrectionItem(wrong="java script", correct="JavaScript")],
+    )
+    monkeypatch.setattr(openai_translate, "preprocess", lambda *a, **kw: pre)
+    _stub_translate_batch(monkeypatch, lambda t: f"zh:{t}")
+
+    openai_translate.translate_asr(asr_file, tmp_path, _settings(), YT_SOURCE)
+    artifact = metadata / "translation_preprocess.json"
+    assert artifact.exists()
+    saved = json.loads(artifact.read_text(encoding="utf-8"))
+    assert saved["summary"] == "Video recap"
+    assert saved["hotwords"][0]["src"] == "Fable 5"
+    assert saved["corrections"][0]["correct"] == "JavaScript"
+
+
+def test_translate_asr_reuses_preprocess_artifact_without_calling_api(tmp_path, monkeypatch):
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    asr_file = metadata / "asr_fixed.json"
+    _write_asr(asr_file, 1)
+    (metadata / "translation_preprocess.json").write_text(
+        json.dumps(
+            {
+                "summary": "cached",
+                "hotwords": [{"src": "GPU", "dst": "GPU"}],
+                "corrections": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fail_preprocess(*args, **kwargs):
+        raise AssertionError("preprocess should not run when artifact exists")
+
+    monkeypatch.setattr(openai_translate, "preprocess", fail_preprocess)
+    seen = _stub_translate_batch(monkeypatch, lambda t: f"zh:{t}")
+
+    openai_translate.translate_asr(asr_file, tmp_path, _settings(), YT_SOURCE)
+    assert len(seen) == 1
+    assert seen[0]["pre"].summary == "cached"
 
 
 def test_translate_asr_writes_schema_with_speaker_and_lang(tmp_path, monkeypatch):

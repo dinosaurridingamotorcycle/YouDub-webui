@@ -15,13 +15,16 @@ import {
 } from "lucide-react"
 
 import {
+  ExecutionMode,
   StageStatus,
   Task,
+  continueTask,
   deleteTask,
   finalVideoDownloadUrl,
   finalVideoUrl,
   getTask,
   getTaskLog,
+  redoStage,
   rerunTask,
   resumeTask,
 } from "@/lib/api"
@@ -95,6 +98,10 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
   const [rerunError, setRerunError] = useState("")
   const [resuming, setResuming] = useState(false)
   const [resumeError, setResumeError] = useState("")
+  const [continuing, setContinuing] = useState(false)
+  const [continueError, setContinueError] = useState("")
+  const [redoingStage, setRedoingStage] = useState<string | null>(null)
+  const [redoError, setRedoError] = useState("")
 
   const handleDelete = async () => {
     setDeleting(true)
@@ -136,8 +143,38 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
     }
   }
 
+  const handleContinue = async () => {
+    setContinuing(true)
+    setContinueError("")
+    try {
+      const next = await continueTask(id)
+      setTask(next)
+    } catch (err) {
+      setContinueError(err instanceof Error ? err.message : t.task.continueError)
+    } finally {
+      setContinuing(false)
+    }
+  }
+
+  const handleRedoStage = async (stageName: string) => {
+    setRedoingStage(stageName)
+    setRedoError("")
+    try {
+      const next = await redoStage(id, stageName)
+      setTask(next)
+    } catch (err) {
+      setRedoError(err instanceof Error ? err.message : t.task.redoStageError)
+    } finally {
+      setRedoingStage(null)
+    }
+  }
+
   const isRunning = task?.status === "running"
+  const isQueued = task?.status === "queued"
   const isFailed = task?.status === "failed"
+  const isPaused = task?.status === "paused"
+  const isManual = task?.execution_mode === "manual"
+  const canRedoStage = isManual && !isRunning && !isQueued
 
   useEffect(() => {
     let cancelled = false
@@ -216,6 +253,10 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                 <dd>{formatTime(task.started_at)}</dd>
                 <dt className="text-muted-foreground">{t.task.completed}</dt>
                 <dd>{formatTime(task.completed_at) || "—"}</dd>
+                <dt className="text-muted-foreground">{t.task.executionMode}</dt>
+                <dd>
+                  {task.execution_mode === "manual" ? t.task.executionManual : t.task.executionAuto}
+                </dd>
                 {task.session_path ? (
                   <>
                     <dt className="text-muted-foreground">{t.task.session}</dt>
@@ -256,10 +297,20 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
             <CardTitle>{t.task.stages}</CardTitle>
           </CardHeader>
           <CardContent>
+            {isManual && canRedoStage ? (
+              <p className="mb-3 text-sm text-muted-foreground">{t.task.redoStageHelp}</p>
+            ) : null}
+            {redoError ? (
+              <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                {redoError}
+              </div>
+            ) : null}
             {task ? (
               <ol className="grid gap-3">
                 {task.stages.map((stage, index) => {
                   const stageProgress = normalizeProgress(stage.progress)
+                  const showRedo =
+                    canRedoStage && (stage.status === "succeeded" || stage.status === "failed")
                   return (
                     <li
                       key={stage.name}
@@ -275,6 +326,22 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
                             <span className="text-xs text-muted-foreground">
                               {durationOf(stage.started_at, stage.completed_at)}
                             </span>
+                          ) : null}
+                          {showRedo ? (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="ml-auto h-7 px-2 text-xs"
+                              disabled={redoingStage !== null}
+                              onClick={() => handleRedoStage(stage.name)}
+                            >
+                              {redoingStage === stage.name ? (
+                                <Loader2 className="size-3 animate-spin" />
+                              ) : (
+                                <RotateCw className="size-3" />
+                              )}
+                              {redoingStage === stage.name ? t.task.redoingStage : t.task.redoStage}
+                            </Button>
                           ) : null}
                         </div>
                         <p className="mt-1 text-sm text-muted-foreground">
@@ -298,6 +365,20 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
             {task?.error_message ? (
               <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
                 {task.error_message}
+              </div>
+            ) : null}
+            {isPaused ? (
+              <div className="mt-4 flex flex-col gap-2 rounded-lg border border-sky-200 bg-sky-50 px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
+                <p className="text-sm text-sky-900">{t.task.continueHelp}</p>
+                <Button onClick={handleContinue} disabled={continuing}>
+                  {continuing ? <Loader2 className="size-4 animate-spin" /> : <Play className="size-4" />}
+                  {continuing ? t.task.continuing : t.task.continueTask}
+                </Button>
+              </div>
+            ) : null}
+            {continueError ? (
+              <div className="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                {continueError}
               </div>
             ) : null}
             {isFailed ? (
