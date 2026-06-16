@@ -11,6 +11,8 @@ from .stages import STAGES
 
 
 ACTIVE_STATUSES = ("queued", "running")
+EXECUTION_MODES = ("auto", "manual")
+DEFAULT_EXECUTION_MODE = "auto"
 
 
 def now_iso() -> str:
@@ -39,7 +41,8 @@ def init_db() -> None:
               error_message TEXT,
               created_at TEXT NOT NULL,
               started_at TEXT,
-              completed_at TEXT
+              completed_at TEXT,
+              execution_mode TEXT NOT NULL DEFAULT 'auto'
             );
 
             CREATE TABLE IF NOT EXISTS task_stages (
@@ -77,6 +80,10 @@ def init_db() -> None:
         task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
         if "title" not in task_columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN title TEXT")
+        if "execution_mode" not in task_columns:
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'auto'"
+            )
         stage_columns = {row["name"] for row in conn.execute("PRAGMA table_info(task_stages)").fetchall()}
         if "progress" not in stage_columns:
             conn.execute("ALTER TABLE task_stages ADD COLUMN progress INTEGER")
@@ -127,16 +134,29 @@ def fail_stale_active_tasks() -> None:
                 )
 
 
-def create_task(url: str, task_id: str | None = None) -> str:
+def normalize_execution_mode(value: str | None) -> str:
+    mode = (value or DEFAULT_EXECUTION_MODE).strip().lower()
+    if mode not in EXECUTION_MODES:
+        raise ValueError(f"execution_mode must be one of: {', '.join(EXECUTION_MODES)}")
+    return mode
+
+
+def create_task(
+    url: str,
+    task_id: str | None = None,
+    *,
+    execution_mode: str = DEFAULT_EXECUTION_MODE,
+) -> str:
     new_id = task_id or str(uuid.uuid4())
     created_at = now_iso()
+    mode = normalize_execution_mode(execution_mode)
     with connect() as conn:
         conn.execute(
             """
-            INSERT INTO tasks (id, url, status, current_stage, created_at)
-            VALUES (?, ?, 'queued', ?, ?)
+            INSERT INTO tasks (id, url, status, current_stage, created_at, execution_mode)
+            VALUES (?, ?, 'queued', ?, ?, ?)
             """,
-            (new_id, url, STAGES[0].name, created_at),
+            (new_id, url, STAGES[0].name, created_at, mode),
         )
         conn.executemany(
             """
@@ -177,7 +197,7 @@ def list_tasks(limit: int = 100) -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute(
             "SELECT id, url, title, status, current_stage, final_video_path, error_message, "
-            "created_at, started_at, completed_at FROM tasks "
+            "created_at, started_at, completed_at, execution_mode FROM tasks "
             "ORDER BY created_at DESC, rowid DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -224,6 +244,47 @@ def delete_task(task_id: str) -> bool:
         cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         conn.execute("DELETE FROM task_stages WHERE task_id = ?", (task_id,))
         return cursor.rowcount > 0
+
+
+def queue_task_for_continue(task_id: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status = 'queued', error_message = NULL, completed_at = NULL
+            WHERE id = ?
+            """,
+            (task_id,),
+        )
+
+
+def reset_stages_from(task_id: str, from_stage: str) -> None:
+    from .stages import STAGE_NAMES
+
+    if from_stage not in STAGE_NAMES:
+        raise ValueError(f"Unknown stage: {from_stage}")
+
+    start = STAGE_NAMES.index(from_stage)
+    with connect() as conn:
+        for stage in STAGE_NAMES[start:]:
+            conn.execute(
+                """
+                UPDATE task_stages
+                SET status = 'pending', started_at = NULL, completed_at = NULL,
+                    progress = NULL, last_message = NULL, error_message = NULL
+                WHERE task_id = ? AND name = ?
+                """,
+                (task_id, stage),
+            )
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status = 'queued', current_stage = ?, final_video_path = NULL,
+                completed_at = NULL, error_message = NULL
+            WHERE id = ?
+            """,
+            (from_stage, task_id),
+        )
 
 
 def reset_failed_for_resume(task_id: str) -> None:

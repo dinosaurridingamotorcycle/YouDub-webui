@@ -20,6 +20,9 @@ from .config import WORKFOLDER, YOUTUBE_COOKIE_PATH, ensure_runtime_dirs
 from .pipeline import run_task
 from .runtime_checks import validate_runtime_device
 from .sanitize import sanitize_text
+from .sources import detect_source
+from .stage_reset import remove_stage_artifacts
+from .stages import STAGE_NAMES
 from .youtube import LOCAL_UPLOAD_DIRECTIONS, extract_video_id, is_local_upload_url
 
 ALLOWED_VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".flv", ".wmv"}
@@ -37,6 +40,11 @@ def mask_secret(value: str) -> str:
 
 class TaskCreate(BaseModel):
     url: str
+    execution_mode: str = "auto"
+
+
+class ContinueTaskRequest(BaseModel):
+    execution_mode: str | None = None
 
 
 class YouTubeCookieUpdate(BaseModel):
@@ -147,6 +155,13 @@ def _ensure_runtime_ready() -> None:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+def normalize_execution_mode(value: str) -> str:
+    try:
+        return database.normalize_execution_mode(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @app.post("/api/tasks", status_code=201)
 def create_task(payload: TaskCreate) -> dict:
     try:
@@ -159,7 +174,11 @@ def create_task(payload: TaskCreate) -> dict:
         return database.get_task(existing_id)
 
     _ensure_runtime_ready()
-    task_id = database.create_task(payload.url.strip(), task_id=video_id)
+    task_id = database.create_task(
+        payload.url.strip(),
+        task_id=video_id,
+        execution_mode=normalize_execution_mode(payload.execution_mode),
+    )
     worker.enqueue(task_id)
     return database.get_task(task_id)
 
@@ -219,6 +238,7 @@ def upload_local_video(
     direction: str = Form("en-zh"),
     file: UploadFile = File(...),
     subtitle_file: UploadFile | None = File(None),
+    execution_mode: str = Form("auto"),
 ) -> dict:
     if direction not in LOCAL_UPLOAD_DIRECTIONS:
         raise HTTPException(status_code=422, detail="Unsupported local video direction.")
@@ -249,7 +269,11 @@ def upload_local_video(
         raise
 
     url = f"local://upload/{task_id}?direction={direction}&filename={quote(original_name)}"
-    database.create_task(url, task_id=task_id)
+    database.create_task(
+        url,
+        task_id=task_id,
+        execution_mode=normalize_execution_mode(execution_mode),
+    )
     database.update_task(task_id, title=Path(original_name).stem)
     worker.enqueue(task_id)
     return database.get_task(task_id)
@@ -317,10 +341,53 @@ def rerun_task(task_id: str) -> dict:
 
     _ensure_runtime_ready()
     url = task["url"]
+    execution_mode = task.get("execution_mode") or database.DEFAULT_EXECUTION_MODE
     _purge_task(task)
-    new_id = database.create_task(url, task_id=task_id)
+    new_id = database.create_task(url, task_id=task_id, execution_mode=execution_mode)
     worker.enqueue(new_id)
     return database.get_task(new_id)
+
+
+@app.post("/api/tasks/{task_id}/stages/{stage_name}/redo")
+def redo_stage(task_id: str, stage_name: str) -> dict:
+    if stage_name not in STAGE_NAMES:
+        raise HTTPException(status_code=404, detail="Stage not found.")
+    task = database.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    if (task.get("execution_mode") or database.DEFAULT_EXECUTION_MODE) != "manual":
+        raise HTTPException(status_code=409, detail="Only manual tasks support per-stage redo.")
+    if task["status"] in {"running", "queued"}:
+        raise HTTPException(status_code=409, detail="Task is already running or queued.")
+    stage = next((item for item in task["stages"] if item["name"] == stage_name), None)
+    if not stage:
+        raise HTTPException(status_code=404, detail="Stage not found.")
+    if stage["status"] not in {"succeeded", "failed"}:
+        raise HTTPException(status_code=409, detail="Only completed or failed stages can be redone.")
+    _ensure_runtime_ready()
+    session_path = task.get("session_path")
+    if session_path:
+        remove_stage_artifacts(Path(session_path), stage_name, detect_source(task["url"]))
+    database.reset_stages_from(task_id, stage_name)
+    worker.enqueue(task_id)
+    return database.get_task(task_id)
+
+
+@app.post("/api/tasks/{task_id}/continue")
+def continue_task(task_id: str, payload: ContinueTaskRequest | None = None) -> dict:
+    task = database.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    if task["status"] != "paused":
+        raise HTTPException(status_code=409, detail="Only paused tasks can be continued.")
+    if (task.get("execution_mode") or database.DEFAULT_EXECUTION_MODE) != "manual":
+        raise HTTPException(status_code=409, detail="Only manual tasks can be continued step by step.")
+    if payload and payload.execution_mode is not None:
+        database.update_task(task_id, execution_mode=normalize_execution_mode(payload.execution_mode))
+    _ensure_runtime_ready()
+    database.queue_task_for_continue(task_id)
+    worker.enqueue(task_id)
+    return database.get_task(task_id)
 
 
 @app.post("/api/tasks/{task_id}/resume")

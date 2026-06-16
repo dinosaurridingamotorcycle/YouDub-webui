@@ -75,14 +75,36 @@ class PipelineRunner:
         if not task:
             return
 
-        database.update_task(self.task_id, status="running", started_at=database.now_iso())
-        self.log("Task started")
+        execution_mode = task.get("execution_mode") or database.DEFAULT_EXECUTION_MODE
+        status = task["status"]
+        if status not in ("queued", "paused"):
+            return
+
+        if status == "queued":
+            updates: dict[str, str] = {"status": "running"}
+            if not task.get("started_at"):
+                updates["started_at"] = database.now_iso()
+            database.update_task(self.task_id, **updates)
+            self.log("Task started")
+        else:
+            database.update_task(self.task_id, status="running")
+            self.log("Task continued")
 
         try:
             validate_runtime_device()
             self.log(f"Device plan: {device_plan_summary()}")
             for stage in STAGES:
+                if self._stage_status(stage.name) == "succeeded":
+                    database.update_task(self.task_id, current_stage=stage.name)
+                    database.update_stage(self.task_id, stage.name, progress=100)
+                    self._restore_cached_stage(stage.name, database.get_task(self.task_id))
+                    self.log(f"[{stage.name}] Reused cached output")
+                    continue
                 self._run_stage(stage.name)
+                if execution_mode == "manual":
+                    database.update_task(self.task_id, status="paused")
+                    self.log(f"Paused after [{stage.name}], waiting for manual continue")
+                    return
             database.update_task(
                 self.task_id,
                 status="succeeded",
@@ -170,12 +192,6 @@ class PipelineRunner:
         return write_uploaded_subtitle_artifacts(subtitle_file, session, source)
 
     def _run_stage(self, stage: str) -> None:
-        if self._stage_status(stage) == "succeeded":
-            database.update_task(self.task_id, current_stage=stage)
-            database.update_stage(self.task_id, stage, progress=100)
-            self._restore_cached_stage(stage, database.get_task(self.task_id))
-            self.log(f"[{stage}] Reused cached output")
-            return
         self._progress_state.pop(stage, None)
         database.update_task(self.task_id, current_stage=stage)
         database.update_stage(
@@ -366,6 +382,11 @@ class PipelineRunner:
             "translate",
             f"Translated {len(items)} sentences -> {self.artifacts.translation_file.name}",
         )
+        from .adapters.openai_translate import preprocess_artifact_path
+
+        preprocess_file = preprocess_artifact_path(session)
+        if preprocess_file.exists():
+            self.log(f"[translate] Preprocess artifact -> {preprocess_file}")
 
     def _split_audio(self, _: dict) -> None:
         from .adapters.audio import split_audio_by_translation

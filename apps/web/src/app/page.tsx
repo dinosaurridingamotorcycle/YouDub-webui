@@ -6,8 +6,9 @@ import { ChangeEvent, FormEvent, useEffect, useRef, useState } from "react"
 import { ChevronRight, Play, Upload } from "lucide-react"
 
 import {
-  TaskSummary,
+  ExecutionMode,
   LocalDirection,
+  TaskSummary,
   createTask,
   listTasks,
   uploadLocalTask,
@@ -38,6 +39,10 @@ function isActive(status: string) {
   return status === "queued" || status === "running"
 }
 
+function isAwaitingAction(status: string) {
+  return status === "paused"
+}
+
 function formatTime(value: string | null) {
   if (!value) return ""
   const date = new Date(value)
@@ -63,6 +68,7 @@ export default function Home() {
   const [localFile, setLocalFile] = useState<File | null>(null)
   const [localSubtitleFile, setLocalSubtitleFile] = useState<File | null>(null)
   const [localDirection, setLocalDirection] = useState<LocalDirection>("en-zh")
+  const [executionMode, setExecutionMode] = useState<ExecutionMode>("auto")
   const [tasks, setTasks] = useState<TaskSummary[]>([])
   const [error, setError] = useState("")
   const [submitting, setSubmitting] = useState(false)
@@ -110,8 +116,8 @@ export default function Home() {
     setSubmitting(true)
     try {
       const created = localFile
-        ? await uploadLocalTask(localFile, localDirection, localSubtitleFile)
-        : await createTask(submittedUrl)
+        ? await uploadLocalTask(localFile, localDirection, localSubtitleFile, executionMode)
+        : await createTask(submittedUrl, executionMode)
       setYoutubeUrl("")
       setBilibiliUrl("")
       setLocalFile(null)
@@ -204,11 +210,26 @@ export default function Home() {
                   type="file"
                   accept=".srt"
                   onChange={selectLocalSubtitleFile}
-                  disabled={hasUrl}
+                  disabled={hasUrl || !hasLocalFile}
                 />
                 <p className="text-xs text-muted-foreground">
                   {t.home.localSubtitleHelp}
                 </p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="execution-mode">{t.home.executionModeLabel}</Label>
+                <Select
+                  value={executionMode}
+                  onValueChange={(value) => setExecutionMode(value as ExecutionMode)}
+                >
+                  <SelectTrigger id="execution-mode" className="h-10">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="auto">{t.home.executionAuto}</SelectItem>
+                    <SelectItem value="manual">{t.home.executionManual}</SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
               <div className="flex items-center justify-between gap-3">
                 {queued > 0 ? (
@@ -260,6 +281,9 @@ export default function Home() {
                             <span>{formatTime(item.created_at)}</span>
                             {isActive(item.status) && item.current_stage ? (
                               <span>· {stageLabel(item.current_stage)}</span>
+                            ) : null}
+                            {isAwaitingAction(item.status) ? (
+                              <span>· {t.status.paused}</span>
                             ) : null}
                           </div>
                         </div>

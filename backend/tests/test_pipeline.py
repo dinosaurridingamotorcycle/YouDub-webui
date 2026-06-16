@@ -191,6 +191,101 @@ def test_stage_progress_is_throttled(monkeypatch, tmp_path):
     assert stage["last_message"] == "Prepared 3/10 TTS clips"
 
 
+def test_pipeline_manual_pauses_after_each_stage(monkeypatch, tmp_path):
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=manualstepx",
+        task_id="manualstepx",
+        execution_mode="manual",
+    )
+
+    def download(self, task):
+        session = tmp_path / "session"
+        media = session / "media"
+        media.mkdir(parents=True)
+        video = media / "video_source.mp4"
+        video.write_bytes(b"video")
+        self.artifacts.session = session
+        self.artifacts.video_file = video
+        database.update_task(self.task_id, session_path=str(session), title="manual")
+
+    monkeypatch.setattr(PipelineRunner, "_download", download)
+
+    def fail_later(name):
+        def handler(self, task):
+            raise AssertionError(f"unexpected stage {name}")
+
+        return handler
+
+    for name in ("_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio", "_merge_video"):
+        monkeypatch.setattr(PipelineRunner, name, fail_later(name))
+
+    PipelineRunner(task_id).run()
+    task = database.get_task(task_id)
+    assert task["status"] == "paused"
+    assert task["stages"][0]["status"] == "succeeded"
+    assert task["stages"][1]["status"] == "pending"
+
+    def separate(self, task):
+        vocals = self.artifacts.session / "media" / "audio_vocals.wav"
+        bgm = self.artifacts.session / "media" / "audio_bgm.wav"
+        vocals.write_bytes(b"v")
+        bgm.write_bytes(b"b")
+        self.artifacts.vocals_file = vocals
+        self.artifacts.bgm_file = bgm
+
+    monkeypatch.setattr(PipelineRunner, "_separate", separate)
+    database.queue_task_for_continue(task_id)
+    PipelineRunner(task_id).run()
+    task = database.get_task(task_id)
+    assert task["status"] == "paused"
+    assert task["stages"][1]["status"] == "succeeded"
+    assert task["stages"][2]["status"] == "pending"
+
+
+def test_pipeline_manual_switch_to_auto_runs_remaining_stages(monkeypatch, tmp_path):
+    configure_db(monkeypatch, tmp_path)
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=manual2auto",
+        task_id="manual2auto",
+        execution_mode="manual",
+    )
+    final_path = tmp_path / "video_final.mp4"
+
+    def download(self, task):
+        session = tmp_path / "session"
+        media = session / "media"
+        media.mkdir(parents=True)
+        video = media / "video_source.mp4"
+        video.write_bytes(b"video")
+        self.artifacts.session = session
+        self.artifacts.video_file = video
+        database.update_task(self.task_id, session_path=str(session), title="manual2auto")
+
+    monkeypatch.setattr(PipelineRunner, "_download", download)
+
+    for name in ("_separate", "_asr", "_asr_fix", "_translate", "_split_audio", "_tts", "_merge_audio"):
+        monkeypatch.setattr(PipelineRunner, name, _noop_stage)
+
+    def merge_video(self, task):
+        self.artifacts.final_video = final_path
+
+    monkeypatch.setattr(PipelineRunner, "_merge_video", merge_video)
+
+    PipelineRunner(task_id).run()
+    task = database.get_task(task_id)
+    assert task["status"] == "paused"
+    assert task["stages"][0]["status"] == "succeeded"
+
+    database.update_task(task_id, execution_mode="auto")
+    database.queue_task_for_continue(task_id)
+    PipelineRunner(task_id).run()
+    task = database.get_task(task_id)
+    assert task["status"] == "succeeded"
+    assert task["execution_mode"] == "auto"
+    assert all(stage["status"] == "succeeded" for stage in task["stages"])
+
+
 def test_pipeline_uses_uploaded_srt_and_skips_model_stages(monkeypatch, tmp_path):
     configure_db(monkeypatch, tmp_path)
     monkeypatch.setattr(pipeline, "WORKFOLDER", tmp_path)
@@ -267,10 +362,11 @@ def test_pipeline_uses_uploaded_srt_and_skips_model_stages(monkeypatch, tmp_path
 
     task = database.get_task(task_id)
     translation_file = session / "metadata" / "translation.zh.json"
-    translation = __import__("json").loads(translation_file.read_text(encoding="utf-8"))["translation"]
+    translation = json.loads(translation_file.read_text(encoding="utf-8"))["translation"]
     log_content = database.log_path(task_id).read_text(encoding="utf-8")
     assert task["status"] == "succeeded"
     assert [item["dst"] for item in translation] == ["你好", "世界"]
     assert "skipped Whisper" in log_content
     assert "skipped sentence splitting" in log_content
     assert "skipped OpenAI translation" in log_content
+

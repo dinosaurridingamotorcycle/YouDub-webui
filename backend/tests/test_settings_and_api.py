@@ -492,6 +492,171 @@ def test_resume_task_rejects_non_failed(monkeypatch, tmp_path):
     assert response.status_code == 409
 
 
+def test_continue_task_requeues_paused_manual_task(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=continuestep",
+        task_id="continuestep",
+        execution_mode="manual",
+    )
+    database.update_task(task_id, status="paused")
+    database.update_stage(task_id, "download", status="succeeded", completed_at=database.now_iso())
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.worker, "enqueue", lambda tid: enqueued.append(tid))
+
+    client = TestClient(main.app)
+    response = client.post(f"/api/tasks/{task_id}/continue")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "queued"
+    assert body["execution_mode"] == "manual"
+    assert enqueued == [task_id]
+
+
+def test_continue_task_can_switch_to_auto(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=continuestepauto",
+        task_id="continuestepauto",
+        execution_mode="manual",
+    )
+    database.update_task(task_id, status="paused")
+    database.update_stage(task_id, "download", status="succeeded", completed_at=database.now_iso())
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.worker, "enqueue", lambda tid: enqueued.append(tid))
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/api/tasks/{task_id}/continue",
+        json={"execution_mode": "auto"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "queued"
+    assert body["execution_mode"] == "auto"
+    assert enqueued == [task_id]
+
+
+def test_continue_task_rejects_auto_task(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=autocontinue", task_id="autocontinue")
+    database.update_task(task_id, status="paused")
+
+    client = TestClient(main.app)
+    response = client.post(f"/api/tasks/{task_id}/continue")
+
+    assert response.status_code == 409
+
+
+def test_redo_stage_requeues_manual_task(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    session = tmp_path / "workfolder" / "redo-session"
+    metadata = session / "metadata"
+    metadata.mkdir(parents=True)
+    translation = metadata / "translation.zh.json"
+    asr_fixed = metadata / "asr_fixed.json"
+    translation.write_text("{}", encoding="utf-8")
+    asr_fixed.write_text("{}", encoding="utf-8")
+
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=redostgapi1",
+        task_id="redostgapi1",
+        execution_mode="manual",
+    )
+    database.update_task(task_id, status="paused", session_path=str(session))
+    for stage in ("download", "separate", "asr", "asr_fix", "translate"):
+        database.update_stage(task_id, stage, status="succeeded", completed_at=database.now_iso())
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.worker, "enqueue", lambda tid: enqueued.append(tid))
+
+    client = TestClient(main.app)
+    response = client.post(f"/api/tasks/{task_id}/stages/translate/redo")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "queued"
+    assert not translation.exists()
+    assert asr_fixed.exists()
+    translate_stage = next(stage for stage in body["stages"] if stage["name"] == "translate")
+    split_stage = next(stage for stage in body["stages"] if stage["name"] == "split_audio")
+    assert translate_stage["status"] == "pending"
+    assert split_stage["status"] == "pending"
+    assert enqueued == [task_id]
+
+
+def test_redo_stage_runtime_failure_preserves_artifacts_and_state(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    session = tmp_path / "workfolder" / "redo-runtime-session"
+    metadata = session / "metadata"
+    tts_dir = session / "segments" / "tts"
+    metadata.mkdir(parents=True)
+    tts_dir.mkdir(parents=True)
+    translation = metadata / "translation.zh.json"
+    tts_file = tts_dir / "0001.wav"
+    translation.write_text("{}", encoding="utf-8")
+    tts_file.write_bytes(b"wav")
+
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=redoruntime",
+        task_id="redoruntime",
+        execution_mode="manual",
+    )
+    database.update_task(task_id, status="paused", session_path=str(session), current_stage="merge_video")
+    for stage in ("download", "separate", "asr", "asr_fix", "translate", "split_audio", "tts"):
+        database.update_stage(task_id, stage, status="succeeded", completed_at=database.now_iso())
+    monkeypatch.setattr(
+        main,
+        "validate_runtime_device",
+        lambda: (_ for _ in ()).throw(RuntimeError("runtime unavailable")),
+    )
+    enqueued: list[str] = []
+    monkeypatch.setattr(main.worker, "enqueue", lambda tid: enqueued.append(tid))
+
+    client = TestClient(main.app)
+    response = client.post(f"/api/tasks/{task_id}/stages/translate/redo")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "runtime unavailable"
+    assert translation.exists()
+    assert tts_file.exists()
+    assert enqueued == []
+    task = database.get_task(task_id)
+    stages = {stage["name"]: stage for stage in task["stages"]}
+    assert task["status"] == "paused"
+    assert stages["translate"]["status"] == "succeeded"
+    assert stages["tts"]["status"] == "succeeded"
+
+
+def test_redo_stage_rejects_auto_task(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    task_id = database.create_task("https://www.youtube.com/watch?v=redostgauto", task_id="redostgauto")
+    database.update_task(task_id, status="paused")
+    database.update_stage(task_id, "download", status="succeeded", completed_at=database.now_iso())
+
+    client = TestClient(main.app)
+    response = client.post(f"/api/tasks/{task_id}/stages/download/redo")
+
+    assert response.status_code == 409
+
+
+def test_redo_stage_rejects_pending_stage(monkeypatch, tmp_path):
+    configure_tmp_runtime(monkeypatch, tmp_path)
+    task_id = database.create_task(
+        "https://www.youtube.com/watch?v=redostgpnd1",
+        task_id="redostgpnd1",
+        execution_mode="manual",
+    )
+    database.update_task(task_id, status="paused")
+    database.update_stage(task_id, "download", status="succeeded", completed_at=database.now_iso())
+
+    client = TestClient(main.app)
+    response = client.post(f"/api/tasks/{task_id}/stages/translate/redo")
+
+    assert response.status_code == 409
+
+
 def test_ytdlp_proxy_port_settings(monkeypatch, tmp_path):
     configure_tmp_runtime(monkeypatch, tmp_path)
     client = TestClient(main.app)
