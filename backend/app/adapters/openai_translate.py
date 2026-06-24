@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import re
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from openai import OpenAI
+from openai import APIError, OpenAI
 from pydantic import BaseModel, Field, ValidationError
 
 from ..sources import SourceConfig
@@ -21,6 +22,14 @@ PREPROCESS_RETRY = 2
 TRANSLATE_RETRY = 2
 DESCRIPTION_LIMIT = 500
 DEFAULT_CONCURRENCY = 50
+# Batch translation: how many sentences are sent in a single chat completion
+# request. Batching is what saves tokens -- the (large) system prompt is sent
+# once per batch instead of once per sentence.
+BATCH_SIZE = 20
+# Exponential backoff for retryable LLM call failures (format errors, rate
+# limits, timeouts). Bounded so a long video does not stall for too long.
+BASE_BACKOFF = 0.5
+MAX_BACKOFF = 8.0
 
 
 class HotwordItem(BaseModel):
@@ -85,17 +94,50 @@ def _extract_json(raw: str) -> dict[str, Any]:
         ) from None
 
 
-def _call_json(client: OpenAI, model: str, system: str, user: str) -> dict[str, Any]:
+def _call_json(
+    client: OpenAI,
+    model: str,
+    system: str,
+    user: str,
+    *,
+    temperature: float = 0.0,
+) -> dict[str, Any]:
     response = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        temperature=0.2,
+        temperature=temperature,
     )
     raw = response.choices[0].message.content or "{}"
     return _extract_json(raw)
+
+
+# Retryable failure modes: malformed JSON / schema, empty output, and OpenAI
+# transport/rate-limit errors. APIError covers RateLimitError, APITimeoutError
+# and APIConnectionError.
+_RETRYABLE_EXCEPTIONS = (json.JSONDecodeError, ValidationError, ValueError, APIError)
+
+
+def _call_with_retry(func: Callable[[], Any], *, attempts: int, label: str) -> Any:
+    """Run ``func`` up to ``attempts`` times with exponential backoff between
+    retries. Raises the last error if all attempts fail."""
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return func()
+        except _RETRYABLE_EXCEPTIONS as exc:
+            last_error = exc
+            if attempt < attempts - 1:
+                delay = min(BASE_BACKOFF * (2 ** attempt), MAX_BACKOFF)
+                log.warning(
+                    "%s attempt %d failed: %s; retrying in %.1fs",
+                    label, attempt + 1, exc, delay,
+                )
+                time.sleep(delay)
+    assert last_error is not None
+    raise last_error
 
 
 def _format_terms(items: list, fmt: str, empty: str) -> str:
@@ -131,16 +173,18 @@ def preprocess(
         **_meta_view(meta),
     )
     client = _client(base_url, api_key)
-    last_error: Exception | None = None
-    for attempt in range(PREPROCESS_RETRY + 1):
-        try:
-            data = _call_json(client, model, "You output strict JSON only.", user)
-            return PreprocessResponse.model_validate(data)
-        except (json.JSONDecodeError, ValidationError) as exc:
-            last_error = exc
-            log.warning("preprocess attempt %d failed: %s", attempt + 1, exc)
-    log.error("preprocess gave up, returning empty: %s", last_error)
-    return PreprocessResponse()
+
+    def attempt() -> PreprocessResponse:
+        data = _call_json(client, model, "You output strict JSON only.", user)
+        return PreprocessResponse.model_validate(data)
+
+    try:
+        return _call_with_retry(
+            attempt, attempts=PREPROCESS_RETRY + 1, label="preprocess"
+        )
+    except Exception as exc:
+        log.error("preprocess gave up, returning empty: %s", exc)
+        return PreprocessResponse()
 
 
 def _translate_system(source: SourceConfig, meta: dict[str, Any], pre: PreprocessResponse) -> str:
@@ -167,18 +211,79 @@ def translate_sentence(
     model: str,
     system: str,
 ) -> str:
-    last_error: Exception | None = None
-    for attempt in range(TRANSLATE_RETRY):
-        try:
-            data = _call_json(client, model, system, text)
-            item = TranslationItem.model_validate(data)
-            if not item.dst.strip():
-                raise ValueError("empty dst")
-            return _post_process(item.dst, target_language)
-        except (json.JSONDecodeError, ValidationError, ValueError) as exc:
-            last_error = exc
-            log.warning("translate attempt %d failed for %r: %s", attempt + 1, text[:60], exc)
-    raise RuntimeError(f"translate_sentence failed after {TRANSLATE_RETRY} attempts: {last_error}")
+    """Translate a single sentence. Used directly as a per-sentence fallback
+    when a batch fails, and kept for backward compatibility."""
+
+    def attempt() -> str:
+        data = _call_json(client, model, system, text)
+        item = TranslationItem.model_validate(data)
+        if not item.dst.strip():
+            raise ValueError("empty dst")
+        return _post_process(item.dst, target_language)
+
+    try:
+        return _call_with_retry(
+            attempt, attempts=TRANSLATE_RETRY, label=f"translate {text[:60]!r}"
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"translate_sentence failed after {TRANSLATE_RETRY} attempts: {exc}"
+        ) from exc
+
+
+def _coerce_dst(item: Any) -> str:
+    """Tolerantly extract a destination string from a batch response item.
+    Accepts both {"dst": "..."} objects and bare strings."""
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        return str(item.get("dst") or item.get("text") or "")
+    return ""
+
+
+def _translate_batch(
+    batch: list[str],
+    target_language: str,
+    client: OpenAI,
+    model: str,
+    system: str,
+) -> list[str]:
+    """Translate a batch of sentences in a single request. If the batch
+    response is unusable after retries, fall back to per-sentence translation
+    so one bad batch does not sink the whole run."""
+    if not batch:
+        return []
+
+    def attempt() -> list[str]:
+        user = json.dumps({"items": batch}, ensure_ascii=False)
+        data = _call_json(client, model, system, user)
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            raise ValueError("response missing 'items' list")
+        if len(items) != len(batch):
+            raise ValueError(
+                f"item count mismatch: sent {len(batch)}, got {len(items)}"
+            )
+        cleaned: list[str] = []
+        for raw in items:
+            dst = _coerce_dst(raw)
+            if not dst.strip():
+                raise ValueError("empty dst in batch")
+            cleaned.append(_post_process(dst, target_language))
+        return cleaned
+
+    try:
+        return _call_with_retry(
+            attempt, attempts=TRANSLATE_RETRY, label=f"translate batch x{len(batch)}"
+        )
+    except Exception as exc:
+        log.warning(
+            "batch translation failed after retries, falling back to per-sentence: %s",
+            exc,
+        )
+        return [
+            translate_sentence(t, target_language, client, model, system) for t in batch
+        ]
 
 
 def translate_batch(
@@ -191,19 +296,43 @@ def translate_batch(
     api_key: str,
     model: str,
     concurrency: int = DEFAULT_CONCURRENCY,
+    on_batch_done: Callable[[int, list[str]], None] | None = None,
 ) -> list[str]:
+    """Translate ``texts`` and return translations in the same order.
+
+    Sentences are grouped into batches of ``BATCH_SIZE`` so the system prompt
+    is sent once per batch rather than once per sentence (the main token
+    saving). Batches run concurrently. ``on_batch_done`` is invoked with the
+    batch index and its results as each batch finishes, enabling incremental
+    checkpointing by the caller.
+    """
     if not texts:
         return []
     system = _translate_system(source, meta, pre)
     client = _client(base_url, api_key)
+    batches = [texts[i:i + BATCH_SIZE] for i in range(0, len(texts), BATCH_SIZE)]
+    total_batches = len(batches)
     log.info(
-        "translate_batch: %d sentences, concurrency=%d", len(texts), concurrency,
+        "translate_batch: %d sentences, %d batches (size=%d), concurrency=%d",
+        len(texts), total_batches, BATCH_SIZE, concurrency,
     )
+
+    results: list[list[str] | None] = [None] * total_batches
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-        return list(pool.map(
-            lambda t: translate_sentence(t, source.target_language, client, model, system),
-            texts,
-        ))
+        future_to_idx = {
+            pool.submit(
+                _translate_batch, batch, source.target_language, client, model, system
+            ): idx
+            for idx, batch in enumerate(batches)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            batch_result = future.result()  # raises on failure (fail loud)
+            results[idx] = batch_result
+            if on_batch_done is not None:
+                on_batch_done(idx, batch_result)
+
+    return [dst for batch_result in results for dst in (batch_result or [])]
 
 
 def _read_meta(session: Path) -> dict[str, Any]:
@@ -245,6 +374,48 @@ def load_preprocess_artifact(session: Path) -> PreprocessResponse | None:
     return PreprocessResponse.model_validate(json.loads(path.read_text(encoding="utf-8")))
 
 
+def _partial_path(session: Path, target_language: str) -> Path:
+    return session / "metadata" / f"translation.{target_language}.partial.json"
+
+
+def _load_partial(session: Path, target_language: str, total: int) -> dict[int, str]:
+    """Load checkpointed per-sentence translations. Returns a mapping of
+    sentence index -> translation for already-completed sentences."""
+    path = _partial_path(session, target_language)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    done = data.get("done") if isinstance(data, dict) else None
+    result: dict[int, str] = {}
+    if isinstance(done, dict):
+        for key, value in done.items():
+            try:
+                idx = int(key)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < total and isinstance(value, str) and value:
+                result[idx] = value
+    return result
+
+
+def _save_partial(
+    session: Path, target_language: str, done: dict[int, str]
+) -> None:
+    path = _partial_path(session, target_language)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {"done": {str(k): v for k, v in done.items()}},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
 def _concurrency_from(settings: dict[str, str]) -> int:
     raw = str(settings.get("translate_concurrency") or "").strip()
     if not raw or not all("0" <= char <= "9" for char in raw):
@@ -270,6 +441,7 @@ def translate_asr(
     texts = [u["text"].strip() for u in utterances]
     full_text = _full_text(data, texts)
     meta = _read_meta(session)
+    total = len(texts)
 
     api = {key: settings[key] for key in API_SETTING_KEYS if key in settings}
     pre = load_preprocess_artifact(session)
@@ -279,24 +451,48 @@ def translate_asr(
         log.info("Wrote translation preprocess artifact to %s", preprocess_artifact_path(session))
     else:
         log.info("Reusing translation preprocess artifact from %s", preprocess_artifact_path(session))
-    dst_list = translate_batch(
-        texts, source, meta, pre, **api, concurrency=_concurrency_from(settings)
-    )
+
+    # Resume support: reuse sentence-level results checkpointed in a previous
+    # interrupted run, so a long video does not have to be fully retranslated.
+    done: dict[int, str] = _load_partial(session, source.target_language, total)
+    pending_indices = [i for i in range(total) if i not in done]
+    pending_texts = [texts[i] for i in pending_indices]
+    if done:
+        log.info("Resuming translation: %d/%d sentences already done", len(done), total)
+
+    if pending_texts:
+        def on_batch_done(batch_index: int, batch_results: list[str]) -> None:
+            start = batch_index * BATCH_SIZE
+            for offset, dst in enumerate(batch_results):
+                global_idx = pending_indices[start + offset]
+                done[global_idx] = dst
+            _save_partial(session, source.target_language, done)
+
+        translate_batch(
+            pending_texts, source, meta, pre, **api,
+            concurrency=_concurrency_from(settings), on_batch_done=on_batch_done,
+        )
+
+    dst_list = [done.get(i, "") for i in range(total)]
 
     translation = [
         {
             "src": text,
-            "dst": dst,
+            "dst": dst_list[i],
             "src_lang": source.asr_language,
             "dst_lang": source.target_language,
             "start_time": utt["start_time"],
             "end_time": utt["end_time"],
             "speaker": _speaker(utt),
         }
-        for text, dst, utt in zip(texts, dst_list, utterances)
+        for i, (text, utt) in enumerate(zip(texts, utterances))
     ]
     output_file.write_text(
         json.dumps({"translation": translation}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    # Clean up the checkpoint now that the final file is written.
+    partial = _partial_path(session, source.target_language)
+    if partial.exists():
+        partial.unlink()
     return output_file

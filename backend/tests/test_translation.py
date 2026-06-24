@@ -30,6 +30,11 @@ def _settings() -> dict[str, str]:
     return {"base_url": "https://example.com/v1", "api_key": "sk-test", "model": "model-x"}
 
 
+def _no_sleep(monkeypatch):
+    # Backoff retries must not actually sleep in tests.
+    monkeypatch.setattr(openai_translate.time, "sleep", lambda *a, **kw: None)
+
+
 def _stub_preprocess(monkeypatch, response: PreprocessResponse | None = None):
     seen: list[dict] = []
 
@@ -46,7 +51,15 @@ def _stub_translate_batch(monkeypatch, transform):
 
     def fake(texts, source, meta, pre, **kw):
         seen.append({"texts": list(texts), "source": source, "meta": meta, "pre": pre, **kw})
-        return [transform(t) for t in texts]
+        results = [transform(t) for t in texts]
+        on_batch_done = kw.get("on_batch_done")
+        if on_batch_done is not None:
+            # Mirror translate_batch's real batching so the caller's checkpoint
+            # mapping (batch_index * BATCH_SIZE) stays correct.
+            size = openai_translate.BATCH_SIZE
+            for idx in range(0, len(texts), size):
+                on_batch_done(idx // size, results[idx:idx + size])
+        return results
 
     monkeypatch.setattr(openai_translate, "translate_batch", fake)
     return seen
@@ -167,7 +180,11 @@ def test_translate_asr_invokes_translate_batch_with_all_texts_at_once(tmp_path, 
 
 
 def test_translate_batch_replaces_em_dash_for_zh_target(monkeypatch):
-    monkeypatch.setattr(openai_translate, "_call_json", lambda *a, **kw: {"dst": "你好——世界"})
+    _no_sleep(monkeypatch)
+    monkeypatch.setattr(
+        openai_translate, "_call_json",
+        lambda *a, **kw: {"items": [{"dst": "你好——世界"}]},
+    )
     monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
 
     out = openai_translate.translate_batch(
@@ -178,8 +195,10 @@ def test_translate_batch_replaces_em_dash_for_zh_target(monkeypatch):
 
 
 def test_translate_batch_does_not_replace_em_dash_for_en_target(monkeypatch):
+    _no_sleep(monkeypatch)
     monkeypatch.setattr(
-        openai_translate, "_call_json", lambda *a, **kw: {"dst": "He said—wait—and left."}
+        openai_translate, "_call_json",
+        lambda *a, **kw: {"items": [{"dst": "He said—wait—and left."}]},
     )
     monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
 
@@ -190,14 +209,18 @@ def test_translate_batch_does_not_replace_em_dash_for_en_target(monkeypatch):
     assert out == ["He said—wait—and left."]
 
 
-def test_translate_batch_uses_shared_system_prompt(monkeypatch):
+def test_translate_batch_uses_one_system_prompt_per_batch(monkeypatch):
+    """Batching means the system prompt is sent once per batch, not once per
+    sentence -- this is the core token-saving behavior."""
+    _no_sleep(monkeypatch)
     captured: list[str] = []
     lock = __import__("threading").Lock()
 
-    def fake_call_json(client, model, system, user):
+    def fake_call_json(client, model, system, user, **kw):
         with lock:
             captured.append(system)
-        return {"dst": f"dst:{user}"}
+        payload = json.loads(user)
+        return {"items": [{"dst": f"dst:{s}"} for s in payload["items"]]}
 
     monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
     monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
@@ -208,7 +231,76 @@ def test_translate_batch_uses_shared_system_prompt(monkeypatch):
         base_url="u", api_key="k", model="m", concurrency=4,
     )
     assert out == [f"dst:s{i}" for i in range(5)]
-    assert len(set(captured)) == 1, "system prompt must be identical across calls for prompt cache"
+    # 5 sentences / batch_size 20 = exactly 1 batch -> exactly 1 LLM call
+    assert len(captured) == 1
+    assert len(set(captured)) == 1
+
+
+def test_translate_batch_groups_sentences_into_batches(monkeypatch):
+    """25 sentences with batch_size 20 must produce 2 LLM calls (20 + 5)."""
+    _no_sleep(monkeypatch)
+    calls: list[int] = []
+
+    def fake_call_json(client, model, system, user, **kw):
+        payload = json.loads(user)
+        srcs = payload["items"]
+        calls.append(len(srcs))
+        return {"items": [{"dst": f"zh:{s}"} for s in srcs]}
+
+    monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+
+    texts = [f"s{i}" for i in range(25)]
+    out = openai_translate.translate_batch(
+        texts, YT_SOURCE, {}, PreprocessResponse(),
+        base_url="u", api_key="k", model="m", concurrency=2,
+    )
+    assert out == [f"zh:s{i}" for i in range(25)]
+    assert sorted(calls) == [5, 20]
+
+
+def test_translate_batch_falls_back_to_per_sentence_on_malformed_response(monkeypatch):
+    """A batch whose response is unusable must fall back to per-sentence
+    translation rather than failing the whole run."""
+    _no_sleep(monkeypatch)
+    sentence_calls: list[str] = []
+
+    def fake_call_json(client, model, system, user, **kw):
+        # Batch request always returns a malformed payload (no 'items').
+        return {"not_items": []}
+
+    def fake_translate_sentence(text, target_language, client, model, system):
+        sentence_calls.append(text)
+        return f"single:{text}"
+
+    monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+    monkeypatch.setattr(openai_translate, "translate_sentence", fake_translate_sentence)
+
+    out = openai_translate.translate_batch(
+        ["a", "b"], YT_SOURCE, {}, PreprocessResponse(),
+        base_url="u", api_key="k", model="m",
+    )
+    assert out == ["single:a", "single:b"]
+    assert sentence_calls == ["a", "b"]
+
+
+def test_call_with_retry_backs_off(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr(openai_translate.time, "sleep", lambda d: sleeps.append(d))
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise ValueError("boom")
+        return "ok"
+
+    result = openai_translate._call_with_retry(flaky, attempts=3, label="t")
+    assert result == "ok"
+    assert calls["n"] == 3
+    # Exponential backoff before the 2nd (0.5s) and 3rd (1.0s) attempts.
+    assert sleeps == [0.5, 1.0]
 
 
 @pytest.mark.parametrize("value", ["abc", "1.5", "0", "-1", "201", ""])
@@ -217,9 +309,10 @@ def test_concurrency_from_bad_saved_values_falls_back_to_default(value):
 
 
 def test_translate_sentence_retries_on_empty_dst(monkeypatch):
+    _no_sleep(monkeypatch)
     calls = {"n": 0}
 
-    def fake_call_json(client, model, system, user):
+    def fake_call_json(client, model, system, user, **kw):
         calls["n"] += 1
         return {"dst": ""} if calls["n"] == 1 else {"dst": "ok"}
 
@@ -231,7 +324,9 @@ def test_translate_sentence_retries_on_empty_dst(monkeypatch):
 
 
 def test_translate_sentence_raises_after_retries(monkeypatch):
-    def fake_call_json(client, model, system, user):
+    _no_sleep(monkeypatch)
+
+    def fake_call_json(client, model, system, user, **kw):
         raise ValueError("boom")
 
     monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
@@ -241,7 +336,9 @@ def test_translate_sentence_raises_after_retries(monkeypatch):
 
 
 def test_preprocess_returns_empty_when_repeatedly_invalid(monkeypatch):
-    def fake_call_json(client, model, system, user):
+    _no_sleep(monkeypatch)
+
+    def fake_call_json(client, model, system, user, **kw):
         return {"summary": 123, "hotwords": "bad"}
 
     monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
@@ -268,3 +365,53 @@ def test_translate_system_prompt_contains_meta_summary_hotwords(monkeypatch):
     assert "Long description" in system
     assert "Recap of the talk." in system
     assert "LEGO -> 乐高" in system
+
+
+def test_save_and_load_partial_roundtrip(tmp_path):
+    openai_translate._save_partial(tmp_path, "zh", {0: "a", 2: "c"})
+    loaded = openai_translate._load_partial(tmp_path, "zh", 5)
+    assert loaded == {0: "a", 2: "c"}
+
+
+def test_translate_asr_resumes_from_partial(tmp_path, monkeypatch):
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    asr_file = metadata / "asr.json"
+    _write_asr(asr_file, 5)
+    # Pretend the first two sentences were already translated in a prior run.
+    openai_translate._save_partial(tmp_path, "zh", {0: "done0", 1: "done1"})
+
+    _stub_preprocess(monkeypatch)
+    seen = _stub_translate_batch(monkeypatch, lambda t: f"zh:{t}")
+
+    openai_translate.translate_asr(asr_file, tmp_path, _settings(), YT_SOURCE)
+    # Only the 3 unfinished sentences should be sent to translate_batch.
+    assert seen[0]["texts"] == ["S2.", "S3.", "S4."]
+    out = json.loads((metadata / "translation.zh.json").read_text(encoding="utf-8"))
+    assert [i["dst"] for i in out["translation"]] == [
+        "done0", "done1", "zh:S2.", "zh:S3.", "zh:S4.",
+    ]
+    # Final file written -> checkpoint must be cleaned up.
+    assert not (metadata / "translation.zh.partial.json").exists()
+
+
+def test_translate_asr_writes_final_file_and_clears_partial(tmp_path, monkeypatch):
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    asr_file = metadata / "asr.json"
+    _write_asr(asr_file, 3)
+    _stub_preprocess(monkeypatch)
+
+    _no_sleep(monkeypatch)
+
+    def fake_call_json(client, model, system, user, **kw):
+        payload = json.loads(user)
+        return {"items": [{"dst": f"zh:{s}"} for s in payload["items"]]}
+
+    monkeypatch.setattr(openai_translate, "_call_json", fake_call_json)
+    monkeypatch.setattr(openai_translate, "_client", lambda *a, **kw: object())
+
+    out = openai_translate.translate_asr(asr_file, tmp_path, _settings(), YT_SOURCE)
+    items = json.loads(out.read_text(encoding="utf-8"))["translation"]
+    assert [i["dst"] for i in items] == ["zh:S0.", "zh:S1.", "zh:S2."]
+    assert not (metadata / "translation.zh.partial.json").exists()

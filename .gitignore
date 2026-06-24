@@ -188,3 +188,10 @@ backend/.pytest_cache/
 backend/.mypy_cache/
 examples/
 backup/
+
+# BB module (self-contained video downloader)
+# 敏感登录凭据，禁止提交
+bb/cookie/
+# 运行时下载产物（视频/音频/字幕/元数据），禁止提交
+bb/download/
+# bb/venv/ 已被上方通用 venv/ 规则覆盖，无需重复声明

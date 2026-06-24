@@ -347,11 +347,12 @@ def get_setting(key: str, default: str = "") -> str:
 
 def get_openai_settings() -> dict[str, str]:
     from .adapters.openai_client import normalize_openai_base_url
+    from .secrets import decrypt_secret
 
     defaults = openai_defaults()
     return {
         "base_url": normalize_openai_base_url(get_setting("openai.base_url", defaults["base_url"])),
-        "api_key": get_setting("openai.api_key", defaults["api_key"]),
+        "api_key": decrypt_secret(get_setting("openai.api_key", defaults["api_key"])),
         "model": get_setting("openai.model", defaults["model"]),
         "translate_concurrency": get_setting(
             "openai.translate_concurrency", defaults["translate_concurrency"]
@@ -368,13 +369,14 @@ def save_openai_settings(
     clear_api_key: bool = False,
 ) -> None:
     from .adapters.openai_client import normalize_openai_base_url
+    from .secrets import encrypt_secret
 
     set_setting("openai.base_url", normalize_openai_base_url(base_url))
     cleaned_api_key = api_key.strip()
     if clear_api_key:
         set_setting("openai.api_key", "")
     elif cleaned_api_key and set(cleaned_api_key) != {"*"}:
-        set_setting("openai.api_key", cleaned_api_key)
+        set_setting("openai.api_key", encrypt_secret(cleaned_api_key))
     set_setting("openai.model", model.strip())
     if translate_concurrency.strip():
         set_setting("openai.translate_concurrency", translate_concurrency.strip())
