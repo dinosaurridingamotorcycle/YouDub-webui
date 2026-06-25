@@ -1,0 +1,78 @@
+---
+description: YouDub 项目导航与代码变更规则，强制修改前查阅分析文档、修改后同步更新
+alwaysApply: true
+enabled: true
+updatedAt: 2026-06-25T08:11:00.000Z
+provider: 
+---
+
+# YouDub 项目导航规则
+
+## 项目简介
+
+YouDub 是本地视频本地化配音流水线工具（YouTube/Bilibili → 目标语言配音版）。
+
+- 后端：FastAPI + SQLite + 单线程 worker，9 阶段流水线（下载→分离→ASR→修正→翻译→切分→TTS→混音→压制）
+- 前端：Next.js 16 App Router + shadcn/ui，2s 轮询，支持 auto/manual 两种执行模式
+- 适配器：`backend/app/adapters/` 下 13 个文件，每个外部能力一个，可独立替换
+
+## 强制规则
+
+### 规则 1：修改前必查
+
+修改 `backend/app/` 或 `apps/web/src/` 代码前，必须先读 `docs/analysis/INDEX.md` 定位影响范围。
+
+详细分析文档在 `docs/analysis/` 下：
+
+| 文档 | 内容 | 何时查阅 |
+|---|---|---|
+| `01-overview.md` | 项目定位、技术栈、目录结构 | 第一次了解项目 |
+| `02-architecture.md` | 架构、数据流、任务生命周期、模块边界 | 理解整体设计 |
+| `03-pipeline.md` | 9 阶段流水线详解（输入/输出/产物/函数链） | 修改流水线逻辑 |
+| `04-adapters.md` | 适配器职责表 + 替换接口与约定 | 替换 ASR/TTS/翻译后端 |
+| `05-code-map.md` | 文件→职责→关键函数映射（含行号） | 定位代码位置 |
+| `06-change-guide.md` | 常见修改场景→该动哪里→注意事项 | 迭代开发防错 |
+
+### 规则 2：修改后必更
+
+修改代码后，同步更新对应文档：
+
+- 修改流水线逻辑 → 更新 `docs/analysis/03-pipeline.md`
+- 修改/新增适配器 → 更新 `docs/analysis/04-adapters.md`
+- 新增/删除文件 → 更新 `docs/analysis/05-code-map.md` 和 `docs/analysis/INDEX.md`
+- 新增流水线阶段 → `stages.py` + `pipeline.py` + `stage_reset.py` 三处同步
+- 新增 API 端点 → `main.py` + `apps/web/src/lib/api.ts` 两端同步
+
+## 文件速查
+
+### 后端核心 (`backend/app/`)
+
+| 文件 | 职责 |
+|---|---|
+| `main.py` | FastAPI 入口，20 个 REST API 路由 |
+| `pipeline.py` | 流水线编排引擎，9 阶段顺序驱动 |
+| `stages.py` | 阶段静态定义（名称 + 显示标签） |
+| `worker.py` | 单线程 FIFO 任务队列 |
+| `database.py` | SQLite 持久化（tasks / task_stages / settings 三表） |
+| `config.py` | 全局路径与环境配置 |
+| `sources.py` | URL 来源识别（YouTube / Bilibili / local） |
+| `stage_reset.py` | 阶段产物清理（手动模式重做支持） |
+| `devices.py` | GPU/CPU 设备解析与验证 |
+| `adapters/` | 13 个适配器文件，每个外部能力一个 |
+
+### 前端核心 (`apps/web/src/`)
+
+| 文件 | 职责 |
+|---|---|
+| `app/page.tsx` | 首页：任务创建表单 + 历史列表（2s 轮询） |
+| `app/tasks/[id]/page.tsx` | 任务详情：阶段/日志/视频/操作（2s 轮询） |
+| `lib/api.ts` | API 客户端 + 全部 TypeScript 类型定义（19 个 API 函数） |
+| `lib/i18n.tsx` | 自建国际化系统（中/英） |
+| `components/settings-dialog.tsx` | 运行设置弹窗（Cookie/代理/OpenAI） |
+
+## 关键约束
+
+1. **适配器无统一基类**：每个适配器是函数式接口，遵循"输入参数 → 落盘产物"约定，替换时保持函数签名和产物格式不变
+2. **产物路径硬编码**：session 目录的产物路径在 `pipeline.py:218-261` 和 `stage_reset.py` 的 `STAGE_OWN_ARTIFACTS` 中硬编码
+3. **单线程串行执行**：worker 是单线程 FIFO 队列，任务一个接一个执行
+4. **无 WebSocket**：前端 2 秒轮询获取状态
